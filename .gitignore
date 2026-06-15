@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Environnements virtuels
+.venv/
+venv/
+env/
+
+# Outils / éditeurs
+.claude/
+.vscode/
+.idea/
+.DS_Store
+
+# NB : bank.csv et les fichiers .joblib sont VOLONTAIREMENT versionnés,
+# l'application Streamlit en a besoin pour fonctionner.
