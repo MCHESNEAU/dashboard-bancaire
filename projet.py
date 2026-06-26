@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.express as px
 
 import joblib
@@ -48,12 +49,58 @@ def _feature_engineering(df_in):
     return d
 
 
+def preparer_features(df_in, colonnes):
+    """Feature engineering + alignement exact sur les colonnes du modèle."""
+    X = _feature_engineering(df_in)
+    return X.reindex(columns=colonnes, fill_value=0)
+
+
 def scorer(df_in, model, scaler, colonnes):
     """Renvoie un tableau de probabilités de souscription (0-1) pour chaque ligne."""
-    X = _feature_engineering(df_in)
-    X = X.reindex(columns=colonnes, fill_value=0)
+    X = preparer_features(df_in, colonnes)
     X_scaled = scaler.transform(X)
     return model.predict_proba(X_scaled)[:, 1]
+
+
+@st.cache_resource
+def charger_explainer():
+    """Explainer SHAP (TreeExplainer) pour le modèle XGBoost (mis en cache)."""
+    import shap
+    model, _, _ = charger_modele()
+    return shap.TreeExplainer(model)
+
+
+# Noms de variables plus lisibles pour l'affichage SHAP.
+def joli_nom(col):
+    remplacements = {
+        "poutcome": "Résultat précédent", "contact": "Contact", "month": "Mois",
+        "job": "Métier", "education": "Éducation", "marital": "Statut marital",
+        "housing": "Prêt immo", "loan": "Prêt perso", "default": "Défaut",
+        "balance_par_age": "Solde/âge", "nb_prets": "Nb de prêts",
+        "jamais_contacte": "Jamais contacté", "tranche_age": "Tranche d'âge",
+        "tranche_jour_mois": "Période du mois", "campaign": "Nb contacts",
+        "pdays": "Jours dernier contact", "previous": "Contacts précédents",
+        "balance": "Solde", "age": "Âge", "day": "Jour",
+    }
+    for cle, val in remplacements.items():
+        if col.startswith(cle):
+            suffixe = col[len(cle):].lstrip("_")
+            return f"{val} = {suffixe}" if suffixe else val
+    return col
+
+
+@st.cache_data
+def importance_globale_shap():
+    """Importance moyenne (|SHAP|) de chaque variable, sur un échantillon."""
+    explainer = charger_explainer()
+    _, scaler, colonnes = charger_modele()
+    echantillon = df.sample(min(500, len(df)), random_state=42)
+    X = preparer_features(echantillon, colonnes)
+    sv = explainer.shap_values(scaler.transform(X))
+    return pd.DataFrame({
+        "variable": [joli_nom(c) for c in colonnes],
+        "importance": np.abs(sv).mean(axis=0),
+    })
 
 
 def graphe_taux(data, colonne, titre, label_x, tri=False, ordre=None):
@@ -386,6 +433,26 @@ with tab4:
         st.error("Modèle introuvable. Lance d'abord : python train_model.py")
         st.stop()
 
+    # ---------- IMPORTANCE GLOBALE (SHAP) ----------
+    with st.expander("📊 Importance globale des variables (SHAP)"):
+        st.caption(
+            "Quelles variables pèsent le plus dans les décisions du modèle "
+            "(impact moyen sur le score, calculé sur un échantillon de clients)."
+        )
+        try:
+            imp = importance_globale_shap().sort_values("importance").tail(12)
+            fig_imp = px.bar(
+                imp, x="importance", y="variable", orientation="h",
+                labels={"importance": "Impact moyen sur le score", "variable": ""},
+                title="Variables les plus influentes",
+                color="importance", color_continuous_scale="Teal",
+            )
+            st.plotly_chart(fig_imp, use_container_width=True)
+        except Exception as e:
+            st.info(f"Importance SHAP indisponible : {e}")
+
+    st.divider()
+
     # Champs de saisie, organisés en 3 colonnes
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -426,6 +493,37 @@ with tab4:
             st.success("✅ Client prioritaire à contacter")
         else:
             st.warning("⚠️ Client peu susceptible de souscrire")
+
+        # --- Explication SHAP de cette prédiction ---
+        st.markdown("#### 🔬 Pourquoi ce score ?")
+        try:
+            explainer = charger_explainer()
+            X_ligne = preparer_features(ligne, colonnes)
+            shap_vals = explainer.shap_values(scaler.transform(X_ligne))[0]
+
+            contrib = pd.DataFrame({
+                "variable": [joli_nom(c) for c in colonnes],
+                "impact": shap_vals,
+            })
+            contrib = contrib[contrib["impact"].abs() > 1e-6]
+            top = contrib.reindex(
+                contrib["impact"].abs().sort_values(ascending=False).index
+            ).head(8).sort_values("impact")
+            top["sens"] = np.where(top["impact"] >= 0, "Favorise", "Défavorise")
+
+            fig_shap = px.bar(
+                top, x="impact", y="variable", orientation="h", color="sens",
+                color_discrete_map={"Favorise": "#4CA777", "Défavorise": "#3B6B8F"},
+                labels={"impact": "Impact sur le score", "variable": "", "sens": ""},
+                title="Facteurs qui ont le plus influencé ce client",
+            )
+            st.plotly_chart(fig_shap, use_container_width=True)
+            st.caption(
+                "🟢 Vert = pousse vers la souscription · 🔵 Bleu = pousse contre. "
+                "Plus la barre est longue, plus l'effet est fort."
+            )
+        except Exception as e:
+            st.info(f"Explication SHAP indisponible : {e}")
 
 
 # ===================== ONGLET 5 : CAMPAGNE CIBLÉE =====================
@@ -543,6 +641,50 @@ with tab5:
                         file_name="clients_a_contacter.csv",
                         mime="text/csv",
                     )
+
+                    # --- Courbe de gain / lift (si le vrai résultat est connu) ---
+                    if "deposit" in resultat.columns:
+                        y_true = (resultat["deposit"] == "yes").astype(int).values
+                        total_sousc = int(y_true.sum())
+                        if total_sousc > 0:
+                            st.divider()
+                            st.markdown("#### 📈 Courbe de gain — efficacité du ciblage")
+
+                            n = len(resultat)
+                            courbe = pd.DataFrame({
+                                "pct_clients": np.arange(1, n + 1) / n * 100,
+                                "pct_captes": np.cumsum(y_true) / total_sousc * 100,
+                            })
+                            fig_gain = px.line(
+                                courbe, x="pct_clients", y="pct_captes",
+                                labels={"pct_clients": "% de clients contactés (mieux notés d'abord)",
+                                        "pct_captes": "% de souscripteurs captés"},
+                                title="Souscripteurs captés selon l'effort d'appel",
+                            )
+                            fig_gain.update_traces(line_color="#4CA777")
+                            fig_gain.add_shape(
+                                type="line", x0=0, y0=0, x1=100, y1=100,
+                                line=dict(dash="dash", color="grey"),
+                            )
+                            pct_sel = len(selection) / n * 100
+                            captes_sel = (selection["deposit"] == "yes").sum() / total_sousc * 100
+                            fig_gain.add_scatter(
+                                x=[pct_sel], y=[captes_sel], mode="markers",
+                                marker=dict(size=12, color="#1A2733"),
+                                name="Ta sélection",
+                            )
+                            st.plotly_chart(fig_gain, use_container_width=True)
+
+                            top10 = resultat.head(max(1, n // 10))
+                            lift10 = ((top10["deposit"] == "yes").mean() * 100) / (
+                                (resultat["deposit"] == "yes").mean() * 100
+                            )
+                            st.caption(
+                                f"💡 Lecture : en appelant **{pct_sel:.0f} %** des clients (ta sélection), "
+                                f"tu captes **{captes_sel:.0f} %** des souscripteurs. "
+                                f"La ligne grise = ciblage au hasard. "
+                                f"Lift du top 10 % : **×{lift10:.2f}**."
+                            )
 
 
 # ===================== ONGLET 6 : DÉCRYPTAGE CAMPAGNE =====================
