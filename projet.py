@@ -4,6 +4,82 @@ import plotly.express as px
 
 import joblib
 import re
+
+# ===================== OUTILS MODÈLE (chargement + scoring) =====================
+# Colonnes brutes minimales attendues dans un fichier de clients à scorer.
+COLONNES_REQUISES = [
+    "age", "job", "marital", "education", "default", "balance", "housing",
+    "loan", "contact", "day", "month", "campaign", "pdays", "previous", "poutcome"
+]
+
+
+@st.cache_resource
+def charger_modele():
+    """Charge le modèle, le scaler et la liste des colonnes (mis en cache)."""
+    model = joblib.load("model_xgb.joblib")
+    scaler = joblib.load("scaler.joblib")
+    colonnes = joblib.load("colonnes_modele.joblib")
+    return model, scaler, colonnes
+
+
+def _feature_engineering(df_in):
+    """Reproduit EXACTEMENT les transformations de train_model.py."""
+    d = df_in.copy()
+    # Colonnes jamais utilisées par le modèle (cible / fuite de données)
+    d = d.drop(columns=[c for c in ["duration", "deposit", "y"] if c in d.columns])
+
+    d["jamais_contacte"] = (d["pdays"] == -1).astype(int)
+    d["nb_prets"] = (d["housing"] == "yes").astype(int) + (d["loan"] == "yes").astype(int)
+    d["balance_par_age"] = d["balance"] / d["age"]
+    d["tranche_jour_mois"] = pd.cut(d["day"], [0, 10, 20, 31],
+                                    labels=["debut", "milieu", "fin"])
+    d["tranche_age"] = pd.cut(d["age"], [0, 25, 35, 50, 60, 100],
+                              labels=["<25", "25-35", "35-50", "50-60", "60+"])
+
+    d = pd.get_dummies(d, drop_first=True)
+    d.columns = [re.sub(r"[\[\]<>(),\s]", "_", str(c)) for c in d.columns]
+    return d
+
+
+def scorer(df_in, model, scaler, colonnes):
+    """Renvoie un tableau de probabilités de souscription (0-1) pour chaque ligne."""
+    X = _feature_engineering(df_in)
+    X = X.reindex(columns=colonnes, fill_value=0)
+    X_scaled = scaler.transform(X)
+    return model.predict_proba(X_scaled)[:, 1]
+
+
+def graphe_taux(data, colonne, titre, label_x, tri=False, ordre=None):
+    """Barres du taux de souscription (%) par catégorie, avec ligne de moyenne.
+
+    Permet de lire d'un coup d'œil ce qui FAVORISE le dépôt : toute barre
+    au-dessus de la ligne moyenne sur-performe.
+    """
+    t = (
+        data.groupby(colonne, observed=True)["deposit"]
+        .apply(lambda s: (s == "yes").mean() * 100)
+        .reset_index(name="taux")
+    )
+    t[colonne] = t[colonne].astype(str)
+    if tri:
+        t = t.sort_values("taux", ascending=False)
+
+    fig = px.bar(
+        t, x=colonne, y="taux",
+        labels={colonne: label_x, "taux": "Taux de souscription (%)"},
+        title=titre,
+        color="taux",
+        color_continuous_scale="Teal",
+        category_orders={colonne: ordre} if ordre else None,
+    )
+    moyenne = (data["deposit"] == "yes").mean() * 100
+    fig.add_hline(
+        y=moyenne, line_dash="dash", line_color="grey",
+        annotation_text=f"Moyenne {moyenne:.1f} %", annotation_position="top left",
+    )
+    return fig
+
+
 # 1. Charger les données
 df = pd.read_csv("bank.csv")
 
@@ -55,8 +131,11 @@ if len(df_filtre) == 0:
 taux = (df_filtre["deposit"] == "yes").mean() * 100
 st.metric("Taux de souscription", f"{taux:.1f} %")
 
-# On crée les 3 onglets
-tab1, tab2, tab3, tab4 = st.tabs(["Profil client", "Argent", "Historique campagne", "Scoring"])
+# On crée les onglets
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    ["Profil client", "Argent", "Historique campagne", "Scoring",
+     "Campagne ciblée", "Décryptage campagne"]
+)
 
 
 # ===================== ONGLET 1 : PROFIL CLIENT =====================
@@ -237,9 +316,7 @@ with tab4:
 
     # Charger le modèle exporté (et gérer le cas où il n'existe pas)
     try:
-        model = joblib.load("model_xgb.joblib")
-        scaler = joblib.load("scaler.joblib")
-        colonnes = joblib.load("colonnes_modele.joblib")
+        model, scaler, colonnes = charger_modele()
     except FileNotFoundError:
         st.error("Modèle introuvable. Lance d'abord : python train_model.py")
         st.stop()
@@ -267,7 +344,7 @@ with tab4:
 
     # Bouton de calcul
     if st.button("Calculer la probabilité", type="primary"):
-        # 1) Construire une ligne au même format que les données d'origine
+        # Construire une ligne au même format que les données d'origine
         ligne = pd.DataFrame([{
             "age": in_age, "job": in_job, "marital": in_marital,
             "education": in_education, "default": in_default, "balance": in_balance,
@@ -276,29 +353,264 @@ with tab4:
             "pdays": in_pdays, "previous": in_previous, "poutcome": in_poutcome
         }])
 
-        # 2) MÊME feature engineering qu'à l'entraînement
-        ligne["jamais_contacte"] = (ligne["pdays"] == -1).astype(int)
-        ligne["nb_prets"] = (ligne["housing"] == "yes").astype(int) + (ligne["loan"] == "yes").astype(int)
-        ligne["balance_par_age"] = ligne["balance"] / ligne["age"]
-        ligne["tranche_jour_mois"] = pd.cut(ligne["day"], [0, 10, 20, 31],
-                                            labels=["debut", "milieu", "fin"])
-        ligne["tranche_age"] = pd.cut(ligne["age"], [0, 25, 35, 50, 60, 100],
-                                      labels=["<25", "25-35", "35-50", "50-60", "60+"])
+        # Scoring via la fonction commune (même feature engineering qu'à l'entraînement)
+        proba = scorer(ligne, model, scaler, colonnes)[0]
 
-        # 3) One-hot + nettoyage des noms (comme à l'entraînement)
-        ligne = pd.get_dummies(ligne, drop_first=True)
-        ligne.columns = [re.sub(r"[\[\]<>(),\s]", "_", str(c)) for c in ligne.columns]
-
-        # 4) ÉTAPE CRUCIALE : aligner sur les colonnes exactes du modèle
-        ligne = ligne.reindex(columns=colonnes, fill_value=0)
-
-        # 5) Standardiser puis prédire
-        ligne_scaled = scaler.transform(ligne)
-        proba = model.predict_proba(ligne_scaled)[0][1]
-
-        # 6) Affichage du résultat
         st.metric("Probabilité de souscription", f"{proba*100:.1f} %")
         if proba >= 0.5:
             st.success("✅ Client prioritaire à contacter")
         else:
             st.warning("⚠️ Client peu susceptible de souscrire")
+
+
+# ===================== ONGLET 5 : CAMPAGNE CIBLÉE =====================
+with tab5:
+    st.subheader("📋 Sélectionner les clients à contacter")
+    st.caption(
+        "Importe un fichier CSV au format de bank.csv. Le modèle score chaque client, "
+        "puis sélectionne ceux à contacter selon le critère que tu choisis."
+    )
+
+    fichier = st.file_uploader("Fichier CSV de clients", type=["csv"])
+
+    if fichier is None:
+        st.info("💡 Dépose un CSV pour lancer le scoring. Tu peux réutiliser bank.csv comme exemple.")
+    else:
+        try:
+            clients = pd.read_csv(fichier)
+        except Exception as e:
+            st.error(f"Impossible de lire le fichier : {e}")
+            clients = None
+
+        if clients is not None:
+            manquantes = [c for c in COLONNES_REQUISES if c not in clients.columns]
+            if manquantes:
+                st.error(
+                    "Le fichier ne contient pas toutes les colonnes nécessaires. "
+                    f"Colonnes manquantes : {', '.join(manquantes)}"
+                )
+            else:
+                try:
+                    model, scaler, colonnes = charger_modele()
+                except FileNotFoundError:
+                    st.error("Modèle introuvable. Lance d'abord : python train_model.py")
+                    st.stop()
+
+                # Scoring de tous les clients du fichier
+                resultat = clients.copy()
+                resultat["proba_souscription"] = (
+                    scorer(clients, model, scaler, colonnes) * 100
+                ).round(1)
+                resultat = resultat.sort_values(
+                    "proba_souscription", ascending=False
+                ).reset_index(drop=True)
+
+                st.success(f"✅ {len(resultat)} clients scorés.")
+
+                # --- Choix du critère de sélection ---
+                mode = st.radio(
+                    "Critère de sélection",
+                    ["Par seuil de probabilité", "Par taux de réussite moyen visé"],
+                    horizontal=True,
+                )
+
+                if mode == "Par seuil de probabilité":
+                    seuil = st.slider(
+                        "Probabilité minimale pour contacter un client (%)",
+                        0, 100, 50, 5,
+                    )
+                    selection = resultat[resultat["proba_souscription"] >= seuil]
+                else:
+                    cible = st.slider(
+                        "Taux de réussite moyen visé pour la liste (%)",
+                        0, 100, 60, 5,
+                    )
+                    # Les clients sont triés par proba décroissante : la moyenne
+                    # cumulée est donc décroissante. On garde le plus grand groupe
+                    # (le mieux scoré) dont la moyenne reste ≥ à la cible.
+                    moyenne_cumulee = resultat["proba_souscription"].expanding().mean()
+                    k = int((moyenne_cumulee >= cible).sum())
+                    selection = resultat.head(k)
+
+                # --- Indicateurs ---
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Clients dans le fichier", len(resultat))
+                col2.metric("Clients à contacter", len(selection))
+                taux_attendu = (
+                    selection["proba_souscription"].mean() if len(selection) else 0
+                )
+                col3.metric("Taux de réussite attendu", f"{taux_attendu:.1f} %")
+
+                if len(selection) == 0:
+                    st.warning("⚠️ Aucun client ne respecte ce critère. Abaisse le seuil / la cible.")
+                else:
+                    # --- Si le vrai résultat est connu : performance réelle ---
+                    if "deposit" in resultat.columns:
+                        perf_selection = (selection["deposit"] == "yes").mean() * 100
+                        perf_globale = (resultat["deposit"] == "yes").mean() * 100
+                        gain = perf_selection - perf_globale
+                        st.success(
+                            f"🎯 Performance réelle : **{perf_selection:.1f} %** des clients ciblés "
+                            f"ont réellement souscrit, contre **{perf_globale:.1f} %** sur l'ensemble "
+                            f"du fichier (gain de **{gain:+.1f} points**)."
+                        )
+
+                    # --- Tableau de la sélection ---
+                    colonnes_affichees = ["proba_souscription"] + [
+                        c for c in ["age", "job", "marital", "education", "balance",
+                                    "housing", "loan", "contact"]
+                        if c in selection.columns
+                    ]
+                    if "deposit" in selection.columns:
+                        colonnes_affichees.append("deposit")
+
+                    st.dataframe(
+                        selection[colonnes_affichees],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                    # --- Téléchargement de la liste d'appels ---
+                    csv_export = selection.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "⬇️ Télécharger la liste d'appels (CSV)",
+                        data=csv_export,
+                        file_name="clients_a_contacter.csv",
+                        mime="text/csv",
+                    )
+
+
+# ===================== ONGLET 6 : DÉCRYPTAGE CAMPAGNE =====================
+with tab6:
+    st.subheader("🔍 Qu'est-ce qui favorise le dépôt ?")
+    st.caption(
+        "Pour chaque caractéristique, on lit le **taux de souscription** par catégorie. "
+        "La ligne grise = moyenne globale : toute barre au-dessus sur-performe. "
+        "Les filtres de la barre latérale s'appliquent ici aussi."
+    )
+
+    ax1, ax2, ax3 = st.tabs(
+        ["💰 Profil bancaire", "📣 Profil de campagne", "👥 Profil socio-démographique"]
+    )
+
+    # -------- AXE 1 : PROFIL BANCAIRE --------
+    with ax1:
+        st.markdown("**Solde, prêts et défaut de paiement**")
+        data_b = df_filtre.copy()
+
+        # Taux par tranche de solde
+        try:
+            data_b["tranche_balance"] = pd.qcut(data_b["balance"], 5, duplicates="drop")
+            st.plotly_chart(
+                graphe_taux(data_b, "tranche_balance",
+                            "Souscription selon le solde", "Tranche de solde (€)"),
+                use_container_width=True,
+            )
+        except ValueError:
+            st.info("Pas assez de diversité de soldes pour créer des tranches avec ces filtres.")
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.plotly_chart(
+                graphe_taux(df_filtre, "housing",
+                            "Selon le prêt immobilier", "Prêt immobilier"),
+                use_container_width=True,
+            )
+        with col_b:
+            st.plotly_chart(
+                graphe_taux(df_filtre, "loan",
+                            "Selon le prêt personnel", "Prêt personnel"),
+                use_container_width=True,
+            )
+
+        # Taux selon le nombre de prêts cumulés
+        data_b["nb_prets"] = (
+            (df_filtre["housing"] == "yes").astype(int)
+            + (df_filtre["loan"] == "yes").astype(int)
+        )
+        st.plotly_chart(
+            graphe_taux(data_b, "nb_prets",
+                        "Selon le nombre de prêts (0, 1 ou 2)", "Nombre de prêts"),
+            use_container_width=True,
+        )
+
+    # -------- AXE 2 : PROFIL DE CAMPAGNE --------
+    with ax2:
+        st.markdown("**Canal de contact, calendrier et pression commerciale**")
+        data_c = df_filtre.copy()
+
+        col_c, col_d = st.columns(2)
+        with col_c:
+            st.plotly_chart(
+                graphe_taux(df_filtre, "contact",
+                            "Selon le type de contact", "Type de contact", tri=True),
+                use_container_width=True,
+            )
+        with col_d:
+            ordre_jour = ["debut", "milieu", "fin"]
+            data_c["tranche_jour"] = pd.cut(
+                data_c["day"], [0, 10, 20, 31], labels=ordre_jour
+            )
+            st.plotly_chart(
+                graphe_taux(data_c, "tranche_jour",
+                            "Selon la période du mois", "Période du mois",
+                            ordre=ordre_jour),
+                use_container_width=True,
+            )
+
+        # Taux par mois (ordonné chronologiquement)
+        ordre_mois = ["jan", "feb", "mar", "apr", "may", "jun",
+                      "jul", "aug", "sep", "oct", "nov", "dec"]
+        st.plotly_chart(
+            graphe_taux(df_filtre, "month",
+                        "Selon le mois de contact", "Mois", ordre=ordre_mois),
+            use_container_width=True,
+        )
+
+        # Taux selon le nombre de contacts durant la campagne
+        data_c["nb_contacts"] = pd.cut(
+            data_c["campaign"], [0, 1, 2, 3, 5, 1000],
+            labels=["1", "2", "3", "4-5", "6+"]
+        )
+        st.plotly_chart(
+            graphe_taux(data_c, "nb_contacts",
+                        "Selon le nombre de contacts durant la campagne",
+                        "Nombre de contacts", ordre=["1", "2", "3", "4-5", "6+"]),
+            use_container_width=True,
+        )
+        st.caption("➡️ Au-delà de quelques contacts, l'acharnement commercial devient souvent contre-productif.")
+
+    # -------- AXE 3 : PROFIL SOCIO-DÉMOGRAPHIQUE --------
+    with ax3:
+        st.markdown("**Âge, métier, éducation et situation maritale**")
+        data_s = df_filtre.copy()
+
+        ordre_age = ["<25", "25-35", "35-50", "50-60", "60+"]
+        data_s["tranche_age"] = pd.cut(
+            data_s["age"], [0, 25, 35, 50, 60, 100], labels=ordre_age
+        )
+        st.plotly_chart(
+            graphe_taux(data_s, "tranche_age",
+                        "Selon la tranche d'âge", "Tranche d'âge", ordre=ordre_age),
+            use_container_width=True,
+        )
+
+        st.plotly_chart(
+            graphe_taux(df_filtre, "job",
+                        "Selon le métier", "Métier", tri=True),
+            use_container_width=True,
+        )
+
+        col_e, col_f = st.columns(2)
+        with col_e:
+            st.plotly_chart(
+                graphe_taux(df_filtre, "education",
+                            "Selon le niveau d'éducation", "Éducation", tri=True),
+                use_container_width=True,
+            )
+        with col_f:
+            st.plotly_chart(
+                graphe_taux(df_filtre, "marital",
+                            "Selon la situation maritale", "Situation maritale", tri=True),
+                use_container_width=True,
+            )
