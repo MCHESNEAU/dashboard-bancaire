@@ -5,6 +5,13 @@ import plotly.express as px
 import joblib
 import re
 
+# Doit être la TOUTE PREMIÈRE commande Streamlit : passe l'app en pleine largeur.
+st.set_page_config(
+    page_title="Dashboard Marketing Bancaire",
+    page_icon="🏦",
+    layout="wide",
+)
+
 # ===================== OUTILS MODÈLE (chargement + scoring) =====================
 # Colonnes brutes minimales attendues dans un fichier de clients à scorer.
 COLONNES_REQUISES = [
@@ -97,6 +104,36 @@ def extremes_taux(data, colonne, min_effectif=30):
     return valides.idxmax(), valides.max(), valides.idxmin(), valides.min()
 
 
+def afficher_synthese(data, dimensions):
+    """Affiche une synthèse dynamique « ce qui favorise le dépôt ».
+
+    dimensions = liste de (colonne, label_indicateur, label_texte).
+    Recalculée selon les filtres ; ignore les catégories peu représentées.
+    """
+    moyenne_g = (data["deposit"] == "yes").mean() * 100
+    resultats = [
+        (lbl_m, lbl_t, extremes_taux(data, col)) for col, lbl_m, lbl_t in dimensions
+    ]
+
+    st.markdown("#### 🧭 Synthèse — ce qui favorise le dépôt")
+    cols = st.columns(1 + len(resultats))
+    cols[0].metric("Taux moyen (sélection)", f"{moyenne_g:.1f} %")
+    for i, (lbl_m, _, ex) in enumerate(resultats, start=1):
+        if ex:
+            cols[i].metric(lbl_m, str(ex[0]), f"{ex[1]:.0f} %")
+
+    points = []
+    for _, lbl_t, ex in resultats:
+        if ex:
+            points.append(
+                f"**{lbl_t}** : `{ex[0]}` performe le mieux ({ex[1]:.0f} %), "
+                f"`{ex[2]}` le moins ({ex[3]:.0f} %)."
+            )
+    if points:
+        st.info("\n\n".join("• " + p for p in points))
+    st.divider()
+
+
 # 1. Charger les données
 df = pd.read_csv("bank.csv")
 
@@ -144,9 +181,19 @@ if len(df_filtre) == 0:
     st.warning("⚠️ Aucun client ne correspond à ces filtres. Élargis ta sélection.")
     st.stop()
 
-# 4. Un chiffre clé
+# 4. Rangée d'indicateurs clés (KPI)
 taux = (df_filtre["deposit"] == "yes").mean() * 100
-st.metric("Taux de souscription", f"{taux:.1f} %")
+nb_clients = len(df_filtre)
+nb_souscripteurs = int((df_filtre["deposit"] == "yes").sum())
+solde_median = int(df_filtre["balance"].median())
+
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Clients (sélection)", f"{nb_clients:,}".replace(",", " "))
+k2.metric("Taux de souscription", f"{taux:.1f} %")
+k3.metric("Souscripteurs", f"{nb_souscripteurs:,}".replace(",", " "))
+k4.metric("Solde médian", f"{solde_median:,} €".replace(",", " "))
+
+st.divider()
 
 # On crée les onglets
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
@@ -157,14 +204,6 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
 
 # ===================== ONGLET 1 : PROFIL CLIENT =====================
 with tab1:
-
-    # --- Histogramme des âges ---
-    st.subheader("Répartition des âges")
-    fig = px.histogram(df_filtre, x="age", color="deposit")
-    st.plotly_chart(fig)
-
-    # --- Souscription par tranche d'âge (reprise du graphique d'origine) ---
-    st.subheader("Répartition des dépôts par tranche d'âge")
 
     # Découpage automatique en 5 tranches égales (comme pd.cut(df['age'], 5))
     df_filtre["tranche_age"] = pd.cut(df_filtre["age"], 5)
@@ -189,7 +228,16 @@ with tab1:
         title="Répartition des dépôts Oui/Non",
         color_discrete_map={"no": "#3B6B8F", "yes": "#4CA777"}
     )
-    st.plotly_chart(fig_age)
+
+    col_g, col_d = st.columns(2)
+    with col_g:
+        st.subheader("Répartition des âges")
+        fig = px.histogram(df_filtre, x="age", color="deposit",
+                           color_discrete_map={"no": "#3B6B8F", "yes": "#4CA777"})
+        st.plotly_chart(fig, use_container_width=True)
+    with col_d:
+        st.subheader("Dépôts par tranche d'âge")
+        st.plotly_chart(fig_age, use_container_width=True)
 
     # --- Souscription selon le nombre de prêts ---
     st.subheader("Taux de souscription selon le nombre de prêts")
@@ -215,7 +263,7 @@ with tab1:
         color_continuous_scale="Teal"
     )
     fig_prets.update_xaxes(tickmode="linear")
-    st.plotly_chart(fig_prets)
+    st.plotly_chart(fig_prets, use_container_width=True)
 
 
 # ===================== ONGLET 2 : ARGENT =====================
@@ -238,16 +286,13 @@ with tab2:
             labels={"tranche_balance": "Tranche de solde (€)", "nombre": "Nb de souscriptions"},
             title="Nombre de souscriptions par tranche de solde"
         )
-        st.plotly_chart(fig_bal)
+        st.plotly_chart(fig_bal, use_container_width=True)
     except ValueError:
         st.info("Pas assez de diversité de soldes pour créer des tranches avec ces filtres.")
 
 
 # ===================== ONGLET 3 : HISTORIQUE CAMPAGNE =====================
 with tab3:
-
-    # --- Taux de souscription selon le résultat passé ---
-    st.subheader("Taux de souscription selon le résultat de la campagne précédente")
 
     taux_poutcome = (
         df_filtre.groupby("poutcome", observed=True)["deposit"]
@@ -265,10 +310,6 @@ with tab3:
         color="deposit",
         color_continuous_scale="Teal"
     )
-    st.plotly_chart(fig_pout)
-
-    # --- Résultat de campagne par métier ---
-    st.subheader("Résultat des campagnes par métier")
 
     df_job = df_filtre[df_filtre["poutcome"] != "unknown"]
 
@@ -288,7 +329,14 @@ with tab3:
         title="Résultat des campagnes précédentes par métier"
     )
     fig_job.update_xaxes(tickangle=-45)
-    st.plotly_chart(fig_job)
+
+    col_p, col_j = st.columns(2)
+    with col_p:
+        st.subheader("Taux selon le résultat passé")
+        st.plotly_chart(fig_pout, use_container_width=True)
+    with col_j:
+        st.subheader("Résultat des campagnes par métier")
+        st.plotly_chart(fig_job, use_container_width=True)
 
 # ===================== ONGLET 4 : SCORING =====================
 with tab4:
@@ -515,6 +563,26 @@ with tab6:
         st.markdown("**Solde, prêts et défaut de paiement**")
         data_b = df_filtre.copy()
 
+        # ----- Synthèse dynamique -----
+        data_syn_b = df_filtre.copy()
+        data_syn_b["nb_prets"] = (
+            (data_syn_b["housing"] == "yes").astype(int)
+            + (data_syn_b["loan"] == "yes").astype(int)
+        )
+        dims_b = [
+            ("housing", "Prêt immobilier", "Prêt immobilier"),
+            ("loan", "Prêt personnel", "Prêt personnel"),
+            ("nb_prets", "Nb de prêts optimal", "Nombre de prêts"),
+        ]
+        try:
+            data_syn_b["tranche_balance"] = pd.qcut(
+                data_syn_b["balance"], 5, duplicates="drop"
+            ).astype(str)
+            dims_b = [("tranche_balance", "Meilleur solde", "Solde")] + dims_b
+        except ValueError:
+            pass
+        afficher_synthese(data_syn_b, dims_b)
+
         # Taux par tranche de solde
         try:
             data_b["tranche_balance"] = pd.qcut(data_b["balance"], 5, duplicates="drop")
@@ -657,6 +725,14 @@ with tab6:
         data_s["tranche_age"] = pd.cut(
             data_s["age"], [0, 25, 35, 50, 60, 100], labels=ordre_age
         )
+
+        # ----- Synthèse dynamique -----
+        afficher_synthese(data_s, [
+            ("tranche_age", "Meilleure tranche d'âge", "Tranche d'âge"),
+            ("job", "Meilleur métier", "Métier"),
+            ("education", "Éducation", "Niveau d'éducation"),
+            ("marital", "Situation maritale", "Situation maritale"),
+        ])
         st.plotly_chart(
             graphe_taux(data_s, "tranche_age",
                         "Selon la tranche d'âge", "Tranche d'âge", ordre=ordre_age),
