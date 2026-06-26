@@ -242,151 +242,14 @@ k4.metric("Solde médian", f"{solde_median:,} €".replace(",", " "))
 
 st.divider()
 
-# On crée les onglets
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-    ["Profil client", "Argent", "Historique campagne", "Scoring",
-     "Campagne ciblée", "Décryptage campagne"]
+# On crée les onglets — narration : on explique, on score, on cible
+tab_decryptage, tab_scoring, tab_cible = st.tabs(
+    ["Décryptage campagne", "Scoring", "Campagne ciblée"]
 )
 
 
-# ===================== ONGLET 1 : PROFIL CLIENT =====================
-with tab1:
-
-    # Découpage automatique en 5 tranches égales (comme pd.cut(df['age'], 5))
-    df_filtre["tranche_age"] = pd.cut(df_filtre["age"], 5)
-
-    rassemblement_par_age = (
-        df_filtre.groupby("tranche_age", observed=True)["deposit"]
-        .value_counts(normalize=True)
-        .rename("pourcentage")
-        .reset_index()
-    )
-    rassemblement_par_age["tranche_age"] = rassemblement_par_age["tranche_age"].astype(str)
-
-    fig_age = px.bar(
-        rassemblement_par_age,
-        x="tranche_age",
-        y="pourcentage",
-        color="deposit",
-        barmode="group",
-        labels={"tranche_age": "tranche age",
-                "pourcentage": "Pourcentage",
-                "deposit": "Dépôt"},
-        title="Répartition des dépôts Oui/Non",
-        color_discrete_map={"no": "#3B6B8F", "yes": "#4CA777"}
-    )
-
-    col_g, col_d = st.columns(2)
-    with col_g:
-        st.subheader("Répartition des âges")
-        fig = px.histogram(df_filtre, x="age", color="deposit",
-                           color_discrete_map={"no": "#3B6B8F", "yes": "#4CA777"})
-        st.plotly_chart(fig, use_container_width=True)
-    with col_d:
-        st.subheader("Dépôts par tranche d'âge")
-        st.plotly_chart(fig_age, use_container_width=True)
-
-    # --- Souscription selon le nombre de prêts ---
-    st.subheader("Taux de souscription selon le nombre de prêts")
-
-    df_filtre["nb_prets"] = (
-        (df_filtre["housing"] == "yes").astype(int)
-        + (df_filtre["loan"] == "yes").astype(int)
-    )
-
-    taux_prets = (
-        df_filtre.groupby("nb_prets")["deposit"]
-        .apply(lambda s: (s == "yes").mean() * 100)
-        .reset_index()
-    )
-
-    fig_prets = px.bar(
-        taux_prets,
-        x="nb_prets",
-        y="deposit",
-        labels={"nb_prets": "Nombre de prêts (0, 1 ou 2)", "deposit": "Taux (%)"},
-        title="Souscription selon le nombre de prêts",
-        color="deposit",
-        color_continuous_scale="Teal"
-    )
-    fig_prets.update_xaxes(tickmode="linear")
-    st.plotly_chart(fig_prets, use_container_width=True)
-
-
-# ===================== ONGLET 2 : ARGENT =====================
-with tab2:
-
-    st.subheader("Nombre de souscriptions par tranche de solde")
-
-    # qcut peut échouer si trop peu de valeurs distinctes après filtrage -> sécurité
-    try:
-        df_filtre["tranche_balance"] = pd.qcut(df_filtre["balance"], q=5, duplicates="drop")
-
-        df_succes = df_filtre[df_filtre["deposit"] == "yes"]
-
-        compte_balance = df_succes["tranche_balance"].value_counts().sort_index().reset_index()
-        compte_balance.columns = ["tranche_balance", "nombre"]
-        compte_balance["tranche_balance"] = compte_balance["tranche_balance"].astype(str)
-
-        fig_bal = px.bar(
-            compte_balance, x="tranche_balance", y="nombre",
-            labels={"tranche_balance": "Tranche de solde (€)", "nombre": "Nb de souscriptions"},
-            title="Nombre de souscriptions par tranche de solde"
-        )
-        st.plotly_chart(fig_bal, use_container_width=True)
-    except ValueError:
-        st.info("Pas assez de diversité de soldes pour créer des tranches avec ces filtres.")
-
-
-# ===================== ONGLET 3 : HISTORIQUE CAMPAGNE =====================
-with tab3:
-
-    taux_poutcome = (
-        df_filtre.groupby("poutcome", observed=True)["deposit"]
-        .apply(lambda s: (s == "yes").mean() * 100)
-        .reset_index()
-        .sort_values("deposit", ascending=False)
-    )
-
-    fig_pout = px.bar(
-        taux_poutcome,
-        x="poutcome",
-        y="deposit",
-        labels={"poutcome": "Résultat campagne précédente", "deposit": "Taux (%)"},
-        title="Souscription selon le résultat passé",
-        color="deposit",
-        color_continuous_scale="Teal"
-    )
-
-    df_job = df_filtre[df_filtre["poutcome"] != "unknown"]
-
-    compte_job = (
-        df_job.groupby(["job", "poutcome"], observed=True)
-        .size()
-        .reset_index(name="nombre")
-    )
-
-    fig_job = px.bar(
-        compte_job,
-        x="job",
-        y="nombre",
-        color="poutcome",
-        barmode="group",
-        labels={"job": "Métier", "nombre": "Nombre de clients", "poutcome": "Résultat"},
-        title="Résultat des campagnes précédentes par métier"
-    )
-    fig_job.update_xaxes(tickangle=-45)
-
-    col_p, col_j = st.columns(2)
-    with col_p:
-        st.subheader("Taux selon le résultat passé")
-        st.plotly_chart(fig_pout, use_container_width=True)
-    with col_j:
-        st.subheader("Résultat des campagnes par métier")
-        st.plotly_chart(fig_job, use_container_width=True)
-
-# ===================== ONGLET 4 : SCORING =====================
-with tab4:
+# ===================== ONGLET : SCORING =====================
+with tab_scoring:
     st.subheader("🎯 Estimer la probabilité de souscription d'un client")
 
     # ---------- ARCHÉTYPE DU CLIENT À CONTACTER ----------
@@ -526,8 +389,8 @@ with tab4:
             st.info(f"Explication SHAP indisponible : {e}")
 
 
-# ===================== ONGLET 5 : CAMPAGNE CIBLÉE =====================
-with tab5:
+# ===================== ONGLET : CAMPAGNE CIBLÉE =====================
+with tab_cible:
     st.subheader("📋 Sélectionner les clients à contacter")
     st.caption(
         "Importe un fichier CSV au format de bank.csv. Le modèle score chaque client, "
@@ -687,8 +550,8 @@ with tab5:
                             )
 
 
-# ===================== ONGLET 6 : DÉCRYPTAGE CAMPAGNE =====================
-with tab6:
+# ===================== ONGLET : DÉCRYPTAGE CAMPAGNE =====================
+with tab_decryptage:
     st.subheader("🔍 Qu'est-ce qui favorise le dépôt ?")
     st.caption(
         "Pour chaque caractéristique, on lit le **taux de souscription** par catégorie. "
