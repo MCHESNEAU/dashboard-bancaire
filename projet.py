@@ -80,6 +80,23 @@ def graphe_taux(data, colonne, titre, label_x, tri=False, ordre=None):
     return fig
 
 
+def extremes_taux(data, colonne, min_effectif=30):
+    """Renvoie (meilleure_cat, taux_max, pire_cat, taux_min) selon le taux de
+    souscription. Ignore les catégories trop peu représentées (< min_effectif)
+    pour éviter qu'un faible échantillon ne fausse la synthèse."""
+    taux = (
+        data.groupby(colonne, observed=True)["deposit"]
+        .apply(lambda s: (s == "yes").mean() * 100)
+    )
+    eff = data.groupby(colonne, observed=True).size()
+    valides = taux[eff >= min_effectif].dropna()
+    if valides.empty:
+        valides = taux.dropna()
+    if valides.empty:
+        return None
+    return valides.idxmax(), valides.max(), valides.idxmin(), valides.min()
+
+
 # 1. Charger les données
 df = pd.read_csv("bank.csv")
 
@@ -538,6 +555,57 @@ with tab6:
     with ax2:
         st.markdown("**Canal de contact, calendrier et pression commerciale**")
         data_c = df_filtre.copy()
+
+        # ----- Synthèse automatique (recalculée selon les filtres) -----
+        data_c["tranche_jour"] = pd.cut(
+            data_c["day"], [0, 10, 20, 31], labels=["debut", "milieu", "fin"]
+        )
+        data_c["nb_contacts"] = pd.cut(
+            data_c["campaign"], [0, 1, 2, 3, 5, 1000],
+            labels=["1", "2", "3", "4-5", "6+"]
+        )
+        moyenne_g = (data_c["deposit"] == "yes").mean() * 100
+
+        ex_contact = extremes_taux(data_c, "contact")
+        ex_mois = extremes_taux(data_c, "month")
+        ex_nb = extremes_taux(data_c, "nb_contacts")
+        ex_pout = extremes_taux(data_c, "poutcome")
+
+        st.markdown("#### 🧭 Synthèse — ce qui favorise le dépôt")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Taux moyen (sélection)", f"{moyenne_g:.1f} %")
+        if ex_contact:
+            m2.metric("Meilleur canal", str(ex_contact[0]), f"{ex_contact[1]:.0f} %")
+        if ex_mois:
+            m3.metric("Meilleur mois", str(ex_mois[0]), f"{ex_mois[1]:.0f} %")
+        if ex_nb:
+            m4.metric("Nb de contacts optimal", str(ex_nb[0]), f"{ex_nb[1]:.0f} %")
+
+        points = []
+        if ex_contact:
+            points.append(
+                f"**Canal** : `{ex_contact[0]}` est le plus efficace "
+                f"({ex_contact[1]:.0f} %), `{ex_contact[2]}` le moins ({ex_contact[3]:.0f} %)."
+            )
+        if ex_mois:
+            points.append(
+                f"**Calendrier** : le mois `{ex_mois[0]}` performe le mieux "
+                f"({ex_mois[1]:.0f} %), `{ex_mois[2]}` le moins ({ex_mois[3]:.0f} %)."
+            )
+        if ex_nb:
+            points.append(
+                f"**Pression commerciale** : `{ex_nb[0]}` contact(s) donne le meilleur "
+                f"résultat ({ex_nb[1]:.0f} %) — multiplier les appels fait souvent chuter le taux."
+            )
+        if ex_pout:
+            points.append(
+                f"**Historique** : un résultat passé `{ex_pout[0]}` mène à {ex_pout[1]:.0f} % "
+                "de souscription — réactiver d'anciens clients convertis est très rentable."
+            )
+        if points:
+            st.info("\n\n".join("• " + p for p in points))
+
+        st.divider()
 
         col_c, col_d = st.columns(2)
         with col_c:
